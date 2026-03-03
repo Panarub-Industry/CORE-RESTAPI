@@ -31,7 +31,9 @@ import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 
 import org.adempiere.exceptions.AdempiereException;
 import org.compiere.model.GridField;
@@ -322,6 +324,7 @@ public class LookupTypeConverter implements ITypeConverter<Object> {
 		}
 		return null;
 	}
+	
 
 	/**
 	 * Find ID using the first column defined as identifier
@@ -329,14 +332,48 @@ public class LookupTypeConverter implements ITypeConverter<Object> {
 	 * @param identifier
 	 * @return
 	 */
+//	private int findId(String tableName, JsonElement identifier) {
+//		MTable table = MTable.get(Env.getCtx(), tableName);
+//		String[] identifiers = table.getIdentifierColumns();
+//		if (identifiers != null && identifiers.length > 0) {
+//			MColumn column = table.getColumn(identifiers[0]);
+//			return getFirstIdOnly(table, column, identifier);
+//		}
+//		return -1;
+//	}
+	
+	/**
+	 * Find ID using the first and second column defined as identifier
+	 * @param tableName
+	 * @param identifier
+	 * @return
+	 */
+	
 	private int findId(String tableName, JsonElement identifier) {
-		MTable table = MTable.get(Env.getCtx(), tableName);
-		String[] identifiers = table.getIdentifierColumns();
-		if (identifiers != null && identifiers.length > 0) {
-			MColumn column = table.getColumn(identifiers[0]);
-			return getFirstIdOnly(table, column, identifier);
-		}
-		return -1;
+	    MTable table = MTable.get(Env.getCtx(), tableName);
+	    if (table == null || identifier == null) {
+	        return -1;
+	    }
+
+	    String[] identifiers = table.getIdentifierColumns();
+	    if (identifiers == null || identifiers.length == 0) {
+	        return -1;
+	    }
+
+	    List<MColumn> columns = new ArrayList<>();
+
+	    for (String colName : identifiers) {
+	        MColumn column = table.getColumn(colName);
+	        if (column != null) {
+	            columns.add(column);
+	        }
+	    }
+
+	    if (columns.isEmpty()) {
+	        return -1;
+	    }
+
+	    return getFirstIdOnly(table, columns, identifier);
 	}
 
 	/**
@@ -409,5 +446,105 @@ public class LookupTypeConverter implements ITypeConverter<Object> {
 
 		return id;
 	}
+	
+	/**
+	 * Get the first ID found, with two parameters identifiers
+	 * @param table
+	 * @param columnName
+	 * @param identifier
+	 * @return
+	 */
+	private int getFirstIdOnly(MTable table, List<MColumn> columns, JsonElement identifier) {
+	    int id = -1;
+	    String tableName = table.getTableName();
+
+	    StringBuilder builder = new StringBuilder()
+	        .append("SELECT ")
+	        .append(tableName)
+	        .append("_ID FROM ")
+	        .append(tableName)
+	        .append(" WHERE ");
+
+	    for (int i = 0; i < columns.size(); i++) {
+	        if (i > 0) {
+	            builder.append(" AND ");
+	        }
+	        builder.append(columns.get(i).getColumnName()).append(" = ?");
+	    }
+
+	    String sql = MRole.getDefault()
+	        .addAccessSQL(builder.toString(), tableName, true, false);
+
+	    try (PreparedStatement stmt = DB.prepareStatement(sql, null)) {
+
+	        // parse identifier sekali saja
+	        String[] parts = identifier.getAsString().split("~");
+
+	        if (parts.length != columns.size()) {
+	            throw new AdempiereException(
+	                "Identifier mismatch. Expected " + columns.size() +
+	                " values but got " + parts.length +
+	                " from " + identifier.getAsString()
+	            );
+	        }
+
+	        for (int i = 0; i < columns.size(); i++) {
+	            MColumn column = columns.get(i);
+	            JsonElement value = new com.google.gson.JsonPrimitive(parts[i]);
+
+	            Object param;
+
+	            if (DisplayType.isID(column.getAD_Reference_ID())) {
+	                param = Integer.valueOf(value.getAsString());
+	            } else if (DisplayType.isNumeric(column.getAD_Reference_ID())) {
+	                param = new java.math.BigDecimal(value.getAsString());
+	            } else if (DisplayType.isDate(column.getAD_Reference_ID())) {
+
+	                Date date;
+	                SimpleDateFormat dateTimeFormat = DisplayType.getTimestampFormat_Default();
+	                SimpleDateFormat dateFormat = DisplayType.getDateFormat_JDBC();
+
+	                try {
+	                    if (column.getAD_Reference_ID() == DisplayType.Date) {
+	                        date = dateFormat.parse(value.getAsString());
+	                    } else {
+	                        date = dateTimeFormat.parse(value.getAsString());
+	                    }
+	                } catch (ParseException e) {
+	                    try {
+	                        date = dateFormat.parse(value.getAsString());
+	                    } catch (ParseException e1) {
+	                        throw new AdempiereException(
+	                            "Date wrongly formatted -> " + value.getAsString()
+	                        );
+	                    }
+	                }
+	                param = new Timestamp(date.getTime());
+
+	            } else {
+	                param = value.getAsString();
+	            }
+
+	            stmt.setObject(i + 1, param);
+	        }
+
+	        ResultSet rs = stmt.executeQuery();
+	        if (rs.next()) {
+	            id = rs.getInt(1);
+	            if (rs.next()) {
+	                throw new AdempiereException(
+	                    "More than one ID found for " + tableName +
+	                    " with identifier " + identifier.toString()
+	                );
+	            }
+	        }
+
+	    } catch (SQLException ex) {
+	        throw new AdempiereException("Error getting the first ID -> " + sql, ex);
+	    }
+
+	    return id;
+	}
+
 
 }
