@@ -33,6 +33,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 
 import javax.ws.rs.core.Response.Status;
@@ -64,6 +65,8 @@ public class RestUtils {
 	private final static String UUID_REGEX="[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}";
 	private final static String EXPORT_UU_LOOKUP_SYSCONFIG_NAME = "REST_TABLES_EXPORT_LOOKUP_UU";
 
+	private static final AtomicInteger windowNoAtomic = new AtomicInteger(1);
+	
 	/**
 	 * @param value
 	 * @return true if value is a UUID identifier
@@ -73,11 +76,23 @@ public class RestUtils {
 	}
 	
 	public static Query getQuery(String tableName, String recordID, boolean fullyQualified, boolean RW) {
+		return getQuery(tableName, recordID, fullyQualified, RW, null);
+	}
+	
+	public static Query getQuery(String tableName, String recordID, boolean fullyQualified, boolean RW, String whereClause) {
 		boolean isUUID = isUUID(recordID);
 		
 		String keyColumn = getKeyColumn(tableName, isUUID);
 		
-		Query query = new Query(Env.getCtx(), tableName, keyColumn + "=?", null);
+		StringBuilder where = new StringBuilder(keyColumn).append("=?");
+		if (!Util.isEmpty(whereClause, true)) {
+			int atIdx = whereClause.indexOf("@");
+			if (atIdx >= 0 && whereClause.indexOf("@", atIdx+1) > atIdx) {
+				whereClause = Env.parseContext(Env.getCtx(), -1, whereClause, false);
+			}
+			where.append(" AND (").append(whereClause).append(")");
+		}
+		Query query = new Query(Env.getCtx(), tableName, where.toString(), null);
 		
 		if (fullyQualified || RW)
 			query.setApplyAccessFilter(fullyQualified, RW);
@@ -143,6 +158,10 @@ public class RestUtils {
 	}
 	
 	public static String[] getSelectedColumns(String tableName, String selectClause) {
+		return getSelectedColumns(null, tableName, selectClause);
+	}
+	
+	public static String[] getSelectedColumns(MRestView restView, String tableName, String selectClause) {
 		List<String> selectedColumns = new ArrayList<String>();
 		if (Util.isEmpty(selectClause, true) || Util.isEmpty(tableName, true))
 			return new String[0];
@@ -150,6 +169,11 @@ public class RestUtils {
 		MTable mTable = MTable.get(Env.getCtx(), tableName);
 		String[] columnNames = selectClause.split("[,]");
 		for(String columnName : columnNames) {
+			if (restView != null) {
+				String restViewColumnName = restView.toColumnName(columnName);
+				if (restViewColumnName != null)
+					columnName = restViewColumnName;
+			}
 			MTable table = mTable;
 			if (table.getColumnIndex(columnName.trim()) < 0)
 				throw new IDempiereRestException(columnName + " is not a valid column of table " + table.getTableName(), Status.BAD_REQUEST);
@@ -363,14 +387,29 @@ public class RestUtils {
 	}
 	
 	public static String getKeyColumnName(String tableName) {
+		return getKeyColumnName(tableName, false);
+	}
+		
+	/**
+	 * Get the primary key column name for a table.
+	 * @param tableName the table name
+	 * @param nullForMultipleKeys if true, return null when table has zero or multiple primary keys; 
+	 *                             if false, throw an exception in those cases
+	 * @return the primary key column name, or null if nullForMultipleKeys is true and table has != 1 primary key
+	 * @throws IDempiereRestException if nullForMultipleKeys is false and table has zero or multiple primary keys
+	 */
+	public static String getKeyColumnName(String tableName, boolean nullForMultipleKeys) {
 		MTable table = MTable.get(Env.getCtx(), tableName);
 		if (table == null)
 			throw new IDempiereRestException("Invalid Table Name", "The requested table name is invalid or does not exist. Please verify the table name and try again.", Status.BAD_REQUEST);
 		
 		String[] keyColumns = table.getKeyColumns();
 		
-		if (keyColumns.length <= 0 || keyColumns.length > 1)
+		if (keyColumns.length <= 0 || keyColumns.length > 1) {
+			if (nullForMultipleKeys)
+				return null;
 			throw new IDempiereRestException("Wrong detail", "Cannot expand to the detail table because it has none or more than one primary key: " + tableName, Status.INTERNAL_SERVER_ERROR);
+		}
 
 		return keyColumns[0];
 	}
@@ -509,5 +548,13 @@ public class RestUtils {
 	public static void removeSavedCtx(int sessionId) {
 		ctxSessionCache.remove(sessionId);
 	}
+    
+    /**
+     * Get a unique window number for context management
+     * @return unique window number
+     */
+    public static int getWindowNo() {
+        return windowNoAtomic.getAndIncrement();
+    }
 
 }
