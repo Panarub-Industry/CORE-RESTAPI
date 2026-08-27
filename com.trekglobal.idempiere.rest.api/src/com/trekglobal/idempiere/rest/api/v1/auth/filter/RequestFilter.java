@@ -100,6 +100,18 @@ public class RequestFilter implements ContainerRequestFilter {
 			|| (   HttpMethod.POST.equals(requestContext.getMethod())
 					&& requestContext.getUriInfo().getPath().endsWith("v1/auth/logout")
 					)
+			|| (   HttpMethod.POST.equals(requestContext.getMethod())
+					&& isInboundWebhookPath(requestContext.getUriInfo().getPath())
+					)
+			|| (   HttpMethod.POST.equals(requestContext.getMethod())
+					&& requestContext.getUriInfo().getPath().endsWith("v1/auth/password-reset/request")
+					)
+			|| (   HttpMethod.POST.equals(requestContext.getMethod())
+					&& requestContext.getUriInfo().getPath().endsWith("v1/auth/password-reset/verify")
+					)
+			|| (   HttpMethod.POST.equals(requestContext.getMethod())
+					&& requestContext.getUriInfo().getPath().endsWith("v1/auth/password-reset/complete")
+					)
 			) {
 			return;
 		}
@@ -207,6 +219,8 @@ public class RequestFilter implements ContainerRequestFilter {
 			if (!user.isActive())
 				throw new JWTVerificationException("User is inactive");
 			Env.setContext(Env.getCtx(), Env.AD_USER_ID, claim.asInt());
+			Env.setContext(Env.getCtx(), Env.AD_USER_NAME, user.getName() );
+			Env.setContext(Env.getCtx(), Env.SALESREP_ID, claim.asInt());
 		}
 		claim = jwt.getClaim(LoginClaims.AD_Role_ID.name());
 		int AD_Role_ID = 0;
@@ -243,6 +257,11 @@ public class RequestFilter implements ContainerRequestFilter {
 			if (session == null)
 				throw new JWTVerificationException("Invalid session claim");
 			if (session.isProcessed()) {
+				if (session.getWebSession().endsWith("-logout")) {
+					// session was logged out
+					requestContext.abortWith(Response.status(Response.Status.UNAUTHORIZED).build());
+					return;
+				}
 				// is possible that the session was finished in a reboot instead of a logout
 				// if there is a REST_AuthToken or a REST_RefreshToken, then the user has not logged out
 				MAuthToken authToken = MAuthToken.get(Env.getCtx(), token);
@@ -259,6 +278,16 @@ public class RequestFilter implements ContainerRequestFilter {
 				throw new JWTVerificationException(errorMessage);
 		}
 		RestUtils.setSessionContextVariables(Env.getCtx());
+	}
+
+	private static boolean isInboundWebhookPath(String path) {
+		if (path == null)
+			return false;
+		String prefix = "v1/webhooks/";
+		if (!path.startsWith(prefix))
+			return false;
+		String remainder = path.substring(prefix.length());
+		return !remainder.isEmpty() && remainder.indexOf('/') < 0;
 	}
 
 }

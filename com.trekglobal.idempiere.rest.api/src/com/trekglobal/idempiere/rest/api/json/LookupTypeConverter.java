@@ -46,6 +46,7 @@ import org.compiere.model.MLookupFactory;
 import org.compiere.model.MPAttributeLookup;
 import org.compiere.model.MPaymentLookup;
 import org.compiere.model.MProcessPara;
+import org.compiere.model.MRefTable;
 import org.compiere.model.MRole;
 import org.compiere.model.MTable;
 import org.compiere.model.MValRule;
@@ -62,7 +63,6 @@ import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonPrimitive;
 import com.trekglobal.idempiere.rest.api.model.MRestView;
-import com.trekglobal.idempiere.rest.api.util.ThreadLocalTrx;
 
 /**
  * json type converter for AD lookup type
@@ -79,28 +79,48 @@ public class LookupTypeConverter implements ITypeConverter<Object> {
 
 	@Override
 	public Object toJsonValue(MColumn column, Object value) {
-		return toJsonValue(column, value, null);
+		return toJsonValue(column, value, (MRestView)null, (String)null);
 	}
-	
+
 	@Override
 	public Object toJsonValue(MColumn column, Object value, MRestView referenceView) {
+		return toJsonValue(column, value, referenceView, (String)null);
+	}
+
+	@Override
+	public Object toJsonValue(MColumn column, Object value, MRestView referenceView, String trxName) {
 		String label = Msg.getElement(Env.getCtx(), column.getColumnName());
-		return toJsonValue(column.getAD_Reference_ID(), label, getColumnLookup(column), column.getReferenceTableName(), value, referenceView);
+		return toJsonValue(column.getAD_Reference_ID(), label, getColumnLookup(column), column.getReferenceTableName(), value, referenceView, trxName);
 	}
 
 	@Override
 	public Object toJsonValue(GridField field, Object value) {
-		return toJsonValue(field.getDisplayType(), field.getHeader(), field.getLookup(), getReferenceTableNameFromField(field), value, null);
+		return toJsonValue(field, value, (String)null);
+	}
+
+	@Override
+	public Object toJsonValue(GridField field, Object value, String trxName) {
+		return toJsonValue(field.getDisplayType(), field.getHeader(), field.getLookup(), getReferenceTableNameFromField(field), value, null, trxName);
 	}
 
 	@Override
 	public Object fromJsonValue(MColumn column, JsonElement value) {
-		return fromJsonValue(column.getAD_Reference_ID(), column.getReferenceTableName(), value);
+		return fromJsonValue(column, value, (MRestView)null, (String)null);
+	}
+
+	@Override
+	public Object fromJsonValue(MColumn column, JsonElement value, MRestView referenceView, String trxName) {
+		return fromJsonValue(column.getAD_Reference_ID(), column.getReferenceTableName(), value, column.getAD_Reference_Value_ID(), trxName);
 	}
 
 	@Override
 	public Object fromJsonValue(GridField field, JsonElement value) {
-		return fromJsonValue(field.getDisplayType(), getReferenceTableNameFromField(field), value);
+		return fromJsonValue(field, value, (String)null);
+	}
+
+	@Override
+	public Object fromJsonValue(GridField field, JsonElement value, String trxName) {
+		return fromJsonValue(field.getDisplayType(), getReferenceTableNameFromField(field), value, field.getAD_Reference_Value_ID(), trxName);
 	}
 	
 	private String getReferenceTableNameFromField(GridField field) {
@@ -117,15 +137,15 @@ public class LookupTypeConverter implements ITypeConverter<Object> {
 		return refTableName;
 	}
 
-	private Object toJsonValue(int displayType, String label, Lookup lookup, String refTableName, Object value, MRestView referenceView) {
+	private Object toJsonValue(int displayType, String label, Lookup lookup, String refTableName, Object value, MRestView referenceView, String trxName) {
 		if (lookup != null && value != null) {
 			JsonObject ref = new JsonObject();
 			if (referenceView == null)
 				ref.addProperty("propertyLabel", label);
 			if (displayType == DisplayType.ChosenMultipleSelectionSearch || displayType == DisplayType.ChosenMultipleSelectionTable) {
-				return toJsonValueForChosenMultipleSelectionTable(lookup, refTableName, value, referenceView, ref);
+				return toJsonValueForChosenMultipleSelectionTable(lookup, refTableName, value, referenceView, ref, trxName);
 			}
-			addRecordIdProperty(lookup, refTableName, value, referenceView, ref);
+			addRecordIdProperty(lookup, refTableName, value, referenceView, ref, trxName);
 			return ref;
 		} else {
 			return null;
@@ -133,13 +153,13 @@ public class LookupTypeConverter implements ITypeConverter<Object> {
 	}
 
 	private Object toJsonValueForChosenMultipleSelectionTable(Lookup lookup, String refTableName, Object value,
-			MRestView referenceView, JsonObject ref) {
+			MRestView referenceView, JsonObject ref, String trxName) {
 		JsonArray array = new JsonArray();
 		String[] values = value.toString().split(",");
 		if (values.length > 0) {
 			for(String v : values) {
 				JsonObject item = new JsonObject();
-				addRecordIdProperty(lookup, refTableName, v, referenceView, item);
+				addRecordIdProperty(lookup, refTableName, v, referenceView, item, trxName);
 				array.add(item);
 			}
 		}
@@ -148,12 +168,12 @@ public class LookupTypeConverter implements ITypeConverter<Object> {
 	}
 
 	private void addRecordIdProperty(Lookup lookup, String refTableName, Object value, MRestView referenceView,
-			JsonObject ref) {
+			JsonObject ref, String trxName) {
 		if (value instanceof Number)
 			ref.addProperty("id", ((Number)value).intValue());
 		else
 			ref.addProperty("id", value.toString());
-		String display = lookup.getDisplay(value);
+		String display = TypeConverterUtils.getIdentifier(lookup, value, trxName);
 		if (!Util.isEmpty(display, true)) {
 			ref.addProperty("identifier", display);
 		}							
@@ -165,7 +185,7 @@ public class LookupTypeConverter implements ITypeConverter<Object> {
 			if (RestUtils.isReturnUULookup(refTableName)) {
 				String uidColumn = PO.getUUIDColumnName(refTableName);
 				String keyColumn = RestUtils.getKeyColumnName(refTableName);
-				String uuid = DB.getSQLValueString(ThreadLocalTrx.getTrxName(), "SELECT " + uidColumn + " FROM " + refTableName + " WHERE " + keyColumn + "=?", value);
+				String uuid = DB.getSQLValueString(trxName, "SELECT " + uidColumn + " FROM " + refTableName + " WHERE " + keyColumn + "=?", value);
 				if (!Util.isEmpty(uuid))
 					ref.addProperty("uuid", uuid);
 			}
@@ -227,17 +247,20 @@ public class LookupTypeConverter implements ITypeConverter<Object> {
 		return lookup;
 	}
 	
-	private Object fromJsonValue(int displayType, String refTableName, JsonElement value) {
+	private Object fromJsonValue(int displayType, String refTableName, JsonElement value, int AD_Reference_Value_ID, String trxName) {
 		if (value != null && value.isJsonObject()) {
 			if (displayType == DisplayType.ChosenMultipleSelectionSearch || displayType == DisplayType.ChosenMultipleSelectionTable) {
-				return fromJsonValueForChosenMultipleSelectionTable(refTableName, value.getAsJsonObject());
+				return fromJsonValueForChosenMultipleSelectionTable(refTableName, value.getAsJsonObject(), AD_Reference_Value_ID, trxName);
 			}
 			JsonObject ref = value.getAsJsonObject();
-			Object id = findRecordId(ref, refTableName);
+			Object id = findRecordId(ref, refTableName, AD_Reference_Value_ID, trxName);
 			if (id != null)
 				return id;
 			else
 				throw new AdempiereException("Could not convert value " + value + " for " + refTableName);
+		} else if (value != null && value.isJsonArray() &&
+			(displayType == DisplayType.ChosenMultipleSelectionSearch || displayType == DisplayType.ChosenMultipleSelectionTable)) {
+			return fromJsonValueForChosenMultipleSelectionTable(refTableName, value, AD_Reference_Value_ID, trxName);
 		} else if (value != null && value.isJsonPrimitive()) {
 			JsonPrimitive primitive = (JsonPrimitive) value;
 			if (primitive.isNumber())
@@ -253,15 +276,23 @@ public class LookupTypeConverter implements ITypeConverter<Object> {
 		}
 	}
 
-	private Object fromJsonValueForChosenMultipleSelectionTable(String refTableName, JsonObject value) {
-		JsonElement selections = value.get("selections");
-		if (selections != null && selections.isJsonArray()) {
-			JsonArray array = selections.getAsJsonArray();
+	private Object fromJsonValueForChosenMultipleSelectionTable(String refTableName, JsonElement value, int AD_Reference_Value_ID, String trxName) {
+		JsonArray array = null;
+		if (value.isJsonArray()) {
+			array = value.getAsJsonArray();
+		} else if (value instanceof JsonObject objectValue) {
+			JsonElement selections = objectValue.get("selections");
+			if (selections != null && selections.isJsonArray()) {
+				array = selections.getAsJsonArray();
+			}
+		}
+		
+		if (array != null) {
 			StringBuilder sb = new StringBuilder();
 			for (JsonElement el : array) {
 				if (el.isJsonObject()) {
 					JsonObject ref = el.getAsJsonObject();
-					Object id = findRecordId(ref, refTableName);
+					Object id = findRecordId(ref, refTableName, AD_Reference_Value_ID, trxName);
 					if (id != null) {
 						if (sb.length() > 0)
 							sb.append(",");
@@ -289,7 +320,7 @@ public class LookupTypeConverter implements ITypeConverter<Object> {
 		throw new AdempiereException("Could not convert value " + value + " for " + refTableName);
 	}
 
-	private Object findRecordId(JsonObject ref, String refTableName) {
+	private Object findRecordId(JsonObject ref, String refTableName, int AD_Reference_Value_ID, String trxName) {
 		JsonElement idField = ref.get("id");
 		if (idField != null) {
 			JsonPrimitive primitive = (JsonPrimitive) idField;
@@ -300,16 +331,16 @@ public class LookupTypeConverter implements ITypeConverter<Object> {
 		}
 		JsonElement identifier = ref.get("identifier");
 		if (identifier != null && !Util.isEmpty(refTableName) && !identifier.isJsonNull()) {
-			int id = findId(refTableName, identifier);
+			int id = findId(refTableName, identifier, AD_Reference_Value_ID, trxName);
 			if (id >= 0)
 				return id;
 		}
-		
+
 		JsonElement uidField = ref.get("uid");
 		if (uidField != null && !Util.isEmpty(refTableName) && !uidField.isJsonNull()) {
 			String uidColumn = PO.getUUIDColumnName(refTableName);
 			String keyColumn = RestUtils.getKeyColumnName(refTableName);
-			int id = DB.getSQLValue(ThreadLocalTrx.getTrxName(), "SELECT " + keyColumn + " FROM " + refTableName + " WHERE " + uidColumn + "=?", uidField.getAsString());
+			int id = DB.getSQLValue(trxName, "SELECT " + keyColumn + " FROM " + refTableName + " WHERE " + uidColumn + "=?", uidField.getAsString());
 			if (id > 0)
 				return id;
 		}
@@ -318,7 +349,7 @@ public class LookupTypeConverter implements ITypeConverter<Object> {
 			uidField = ref;
 			JsonElement searchValue = ref.get("lookupValue");
 
-			int id = findIdbyColumn(refTableName, columnName.getAsString(), searchValue);
+			int id = findIdbyColumn(refTableName, columnName.getAsString(), searchValue, trxName);
 			if (id >= 0)
 				return id;
 		}
@@ -332,48 +363,31 @@ public class LookupTypeConverter implements ITypeConverter<Object> {
 	 * @param identifier
 	 * @return
 	 */
-//	private int findId(String tableName, JsonElement identifier) {
-//		MTable table = MTable.get(Env.getCtx(), tableName);
-//		String[] identifiers = table.getIdentifierColumns();
-//		if (identifiers != null && identifiers.length > 0) {
-//			MColumn column = table.getColumn(identifiers[0]);
-//			return getFirstIdOnly(table, column, identifier);
-//		}
-//		return -1;
-//	}
-	
-	/**
-	 * Find ID using the first and second column defined as identifier
-	 * @param tableName
-	 * @param identifier
-	 * @return
-	 */
-	
-	private int findId(String tableName, JsonElement identifier) {
-	    MTable table = MTable.get(Env.getCtx(), tableName);
-	    if (table == null || identifier == null) {
-	        return -1;
-	    }
+	private int findId(String tableName, JsonElement identifier, int AD_Reference_Value_ID, String trxName) {
+		MTable table = MTable.get(Env.getCtx(), tableName);
+		// check identifier first for backward compatibility
+		String[] identifiers = table.getIdentifierColumns();
+		if (identifiers != null && identifiers.length > 0) {
+			MColumn column = table.getColumn(identifiers[0]);
+			int id = getFirstIdOnly(table, column, identifier, trxName);
+			if (id >= 0)
+				return id;
+		}
 
-	    String[] identifiers = table.getIdentifierColumns();
-	    if (identifiers == null || identifiers.length == 0) {
-	        return -1;
-	    }
+		// check refTable display column
+		if (AD_Reference_Value_ID > 0) {
+			MRefTable refTable = MRefTable.get(AD_Reference_Value_ID);
+			if (refTable != null) {
+				int columnId = refTable.getAD_Display();
+				if (columnId > 0) {
+					MColumn column = MColumn.get(Env.getCtx(), columnId);
+					if (column != null)
+						return getFirstIdOnly(table, column, identifier, trxName);
+				}
+			}
+		}
 
-	    List<MColumn> columns = new ArrayList<>();
-
-	    for (String colName : identifiers) {
-	        MColumn column = table.getColumn(colName);
-	        if (column != null) {
-	            columns.add(column);
-	        }
-	    }
-
-	    if (columns.isEmpty()) {
-	        return -1;
-	    }
-
-	    return getFirstIdOnly(table, columns, identifier);
+		return -1;
 	}
 
 	/**
@@ -383,12 +397,12 @@ public class LookupTypeConverter implements ITypeConverter<Object> {
 	 * @param searchValue
 	 * @return
 	 */
-	private int findIdbyColumn(String tableName, String columnName, JsonElement searchValue) {
+	private int findIdbyColumn(String tableName, String columnName, JsonElement searchValue, String trxName) {
 		MTable table = MTable.get(Env.getCtx(), tableName);
 		MColumn column = table.getColumn(columnName);
 		if (column == null)
 			throw new AdempiereException("Column not found -> " + tableName + "." + columnName);
-		return getFirstIdOnly(table, column, searchValue);
+		return getFirstIdOnly(table, column, searchValue, trxName);
 	}
 
 	/**
@@ -398,7 +412,7 @@ public class LookupTypeConverter implements ITypeConverter<Object> {
 	 * @param identifier
 	 * @return
 	 */
-	private int getFirstIdOnly(MTable table, MColumn column, JsonElement identifier) {
+	private int getFirstIdOnly(MTable table, MColumn column, JsonElement identifier, String trxName) {
 		int id = -1;
 		String tableName = table.getTableName();
 		StringBuilder builder = new StringBuilder()
@@ -406,7 +420,7 @@ public class LookupTypeConverter implements ITypeConverter<Object> {
 		   .append(" WHERE ").append(column.getColumnName()).append("=?");
 		String sql = MRole.getDefault().addAccessSQL(builder.toString(), tableName, true, false);
 
-		try (PreparedStatement stmt = DB.prepareStatement(sql, null)) {
+		try (PreparedStatement stmt = DB.prepareStatement(sql, trxName)) {
 			Object param;
 			if (DisplayType.isID(column.getAD_Reference_ID()))
 				param = identifier.getAsInt();

@@ -31,10 +31,14 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Timestamp;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
 import java.util.logging.Level;
 import java.util.zip.ZipEntry;
@@ -44,28 +48,40 @@ import javax.ws.rs.core.Response;
 import javax.ws.rs.core.Response.Status;
 import javax.xml.bind.DatatypeConverter;
 
+import org.adempiere.base.event.EventHelper;
 import org.adempiere.base.event.EventManager;
 import org.adempiere.base.event.EventProperty;
 import org.adempiere.base.event.IEventManager;
+import org.adempiere.base.event.IEventTopics;
 import org.adempiere.exceptions.AdempiereException;
 import org.adempiere.exceptions.CrossTenantException;
+import org.compiere.model.GridField;
+import org.compiere.model.GridFieldVO;
+import org.compiere.model.MArchive;
 import org.compiere.model.MAttachment;
 import org.compiere.model.MAttachmentEntry;
+import org.compiere.model.MColumn;
 import org.compiere.model.MTable;
 import org.compiere.model.MWindow;
 import org.compiere.model.PO;
+import org.compiere.model.POInfo;
 import org.compiere.model.Query;
 import org.compiere.process.DocAction;
 import org.compiere.process.ProcessInfo;
 import org.compiere.util.CLogger;
 import org.compiere.util.DB;
+import org.compiere.util.DefaultEvaluatee;
+import org.compiere.util.DefaultEvaluatee.DataProvider;
+import org.compiere.util.DisplayType;
 import org.compiere.util.Env;
+import org.compiere.util.Evaluator;
 import org.compiere.util.MimeType;
 import org.compiere.util.Msg;
 import org.compiere.util.Trx;
 import org.compiere.util.Util;
 import org.compiere.wf.MWorkflow;
 import org.osgi.service.event.Event;
+import org.osgi.service.event.EventHandler;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -84,7 +100,9 @@ import com.trekglobal.idempiere.rest.api.json.expand.ExpandUtils;
 import com.trekglobal.idempiere.rest.api.json.filter.ConvertedQuery;
 import com.trekglobal.idempiere.rest.api.json.filter.IQueryConverter;
 import com.trekglobal.idempiere.rest.api.model.MRestView;
+import com.trekglobal.idempiere.rest.api.model.MRestViewColumn;
 import com.trekglobal.idempiere.rest.api.model.MRestViewRelated;
+import com.trekglobal.idempiere.rest.api.util.ErrorBuilder;
 import com.trekglobal.idempiere.rest.api.util.ThreadLocalTrx;
 import com.trekglobal.idempiere.rest.api.v1.resource.ModelResource;
 import com.trekglobal.idempiere.rest.api.v1.resource.WindowResource;
@@ -423,24 +441,47 @@ public class ModelResourceImpl implements ModelResource {
 			Gson gson = new GsonBuilder().create();
 			JsonObject jsonObject = gson.fromJson(jsonText, JsonObject.class);
 			IPOSerializer serializer = IPOSerializer.getPOSerializer(tableName, MTable.getClass(tableName));
-			serializer.setWindowNo(windowNo);
-			PO po = serializer.fromJson(jsonObject, table, view);
+			PO po = serializer.fromJson(jsonObject, table, view, trx.getTrxName());
+			if (po.getAD_Client_ID() != Env.getAD_Client_ID(Env.getCtx())) {
+				log.log(Level.SEVERE, "Tenant " + Env.getAD_Client_ID(Env.getCtx()) + " attempt to create record for tenant: " + po.getAD_Client_ID(), 
+						new CrossTenantException(true, po.get_TableName(), -1));
+				return ResponseUtils.getResponseError(Status.FORBIDDEN, "Update error", "You are not allowed to create a record for another tenant","");
+			}
 			if (!RestUtils.hasRoleUpdateAccess(po.getAD_Client_ID(), po.getAD_Org_ID(), po.get_Table_ID(), 0, true))
 				return ResponseUtils.getResponseError(Status.FORBIDDEN, "Update error", "Role does not have access","");
 
 			po.set_TrxName(trx.getTrxName());
+
+			// Handler for mandatory fields validation
+			MRestView finalView = view;
+			JsonObject finalJsonObject = jsonObject;
+			EventHandler eventHandler = (Event evt) ->{
+				PO eventPO = EventHelper.getPO(evt);
+				if (eventPO == po) {
+					validateMandatoryColumns(po, finalView, finalJsonObject, evt, windowNo);
+				}
+			};
+
 			fireRestSaveEvent(po, PO_BEFORE_REST_SAVE, true);
 			try {
-				po.validForeignKeysEx();
+				try {
+					po.validForeignKeysEx();
+				} catch (AdempiereException ex) {
+					throw new IDempiereRestException(Msg.getMsg(po.getCtx(), "ValidationError"), ex.getMessage(), Status.BAD_REQUEST);
+				}
+				String tableFilter = "(tableName="+po.get_TableName()+")";
+				EventManager.getInstance().register(IEventTopics.PO_BEFORE_NEW, tableFilter, eventHandler);
 				po.saveEx();
 				fireRestSaveEvent(po, PO_AFTER_REST_SAVE, true);
 			} catch (CrossTenantException e) {
 				trx.rollback();
-				return ResponseUtils.getResponseError(Status.INTERNAL_SERVER_ERROR, "Save error", 
+				return ResponseUtils.getResponseError(Status.BAD_REQUEST, Msg.getMsg(po.getCtx(), "ValidationError"), 
 						"Foreign ID " + e.getFKValue() + " not found in ", String.valueOf(e.getFKColumn()));
 			} catch (Exception ex) {
 				trx.rollback();
 				return ResponseUtils.getResponseErrorFromException(ex, "Save error");
+			} finally {
+				EventManager.getInstance().unregister(eventHandler);
 			}
 			Map<String, JsonArray> detailMap = new LinkedHashMap<>();
 			Set<String> fields = jsonObject.keySet();
@@ -460,7 +501,7 @@ public class ModelResourceImpl implements ModelResource {
 			if (threadLocalTrxName == null)
 				trx.commit(true);
 			po.load(trx.getTrxName());
-			jsonObject = serializer.toJson(po, view);
+			jsonObject = serializer.toJson(po, view, trx.getTrxName());
 			if (processMsg.length() > 0)
 				jsonObject.addProperty("doc-processmsg", processMsg.toString());
 			if (detailMap.size() > 0) {
@@ -492,7 +533,7 @@ public class ModelResourceImpl implements ModelResource {
 	 */
 	private String createChild(String field, JsonObject jsonObject, PO po, MRestView view, Map<String, JsonArray> detailMap, Trx trx, int windowNo) {
 		JsonElement fieldElement = jsonObject.get(field);
-		if (fieldElement != null && fieldElement.isJsonArray()) {
+		if (fieldElement != null && fieldElement.isJsonArray() && po.get_ColumnIndex(field) == -1) {
 			String childTableName = field;
 			MRestView childView = null;
 			if (view != null) {
@@ -520,7 +561,6 @@ public class ModelResourceImpl implements ModelResource {
 
 			if (childTable != null && childTable.getAD_Table_ID() > 0) {
 				IPOSerializer childSerializer = IPOSerializer.getPOSerializer(childTableName, MTable.getClass(childTableName));
-				childSerializer.setWindowNo(windowNo);
 				JsonArray fieldArray = fieldElement.getAsJsonArray();
 				JsonArray savedArray = new JsonArray();
 				try {
@@ -528,7 +568,7 @@ public class ModelResourceImpl implements ModelResource {
 					fieldArray.forEach(e -> {
 						if (e.isJsonObject()) {
 							JsonObject childJsonObject = e.getAsJsonObject();
-							PO childPO = childSerializer.fromJson(childJsonObject, childTable, finalChildView);
+							PO childPO = childSerializer.fromJson(childJsonObject, childTable, finalChildView, trx.getTrxName());
 							if (!RestUtils.hasRoleUpdateAccess(childPO.getAD_Client_ID(), childPO.getAD_Org_ID(), childPO.get_Table_ID(), 0, true))
 								throw new AdempiereException("AccessCannotUpdate");
 							
@@ -541,10 +581,26 @@ public class ModelResourceImpl implements ModelResource {
 								childPO.set_ValueOfColumn(RestUtils.getKeyColumnName(po.get_TableName()), po.get_ID());
 							
 							fireRestSaveEvent(childPO, PO_BEFORE_REST_SAVE, true);
+
+							// Event handler for mandatory fields validation
+							JsonObject finalChildJsonObject = childJsonObject;
+							EventHandler eventHandler = (Event evt) ->{
+								PO eventPO = EventHelper.getPO(evt);
+								if (eventPO == childPO) {
+									validateMandatoryColumns(childPO, finalChildView, finalChildJsonObject, evt, windowNo);
+								}
+							};
+							
 							childPO.validForeignKeysEx();
-							childPO.saveEx();
+							try {
+								String tableFilter = "(tableName="+childPO.get_TableName()+")";
+								EventManager.getInstance().register(IEventTopics.PO_BEFORE_NEW, tableFilter, eventHandler);							
+								childPO.saveEx();
+							} finally {
+								EventManager.getInstance().unregister(eventHandler);
+							}
 							fireRestSaveEvent(childPO, PO_AFTER_REST_SAVE, true);
-							childJsonObject = childSerializer.toJson(childPO, finalChildView);
+							childJsonObject = childSerializer.toJson(childPO, finalChildView, trx.getTrxName());
 							JsonObject newChildJsonObject = e.getAsJsonObject();
 							Map<String, JsonArray> childDetailMap = new LinkedHashMap<>();
 							Set<String> fields = newChildJsonObject.keySet();
@@ -571,6 +627,9 @@ public class ModelResourceImpl implements ModelResource {
 				} catch (Exception ex) {
 					trx.rollback();
 					log.log(Level.SEVERE, ex.getMessage(), ex);
+					IDempiereRestException restEx = ResponseUtils.findRestException(ex);
+					if (restEx != null)
+						throw restEx;
 					
 					if (ex instanceof CrossTenantException) 
 						return "Foreign ID " + ((CrossTenantException)ex).getFKValue() + " not found in " + String.valueOf(((CrossTenantException)ex).getFKColumn());
@@ -613,21 +672,40 @@ public class ModelResourceImpl implements ModelResource {
 			Gson gson = new GsonBuilder().create();
 			JsonObject jsonObject = gson.fromJson(jsonText, JsonObject.class);
 			IPOSerializer serializer = IPOSerializer.getPOSerializer(tableName, MTable.getClass(tableName));
-			serializer.setWindowNo(windowNo);
-			po = serializer.fromJson(jsonObject, po, view);
+			po = serializer.fromJson(jsonObject, po, view, trx.getTrxName());			
 			po.set_TrxName(trx.getTrxName());
+
+			// Event handler for mandatory fields validation
+			PO finalPO = po;
+			MRestView finalView = view;
+			JsonObject finalJsonObject = jsonObject;
+			EventHandler eventHandler = (Event evt) ->{
+				PO eventPO = EventHelper.getPO(evt);
+				if (eventPO == finalPO) {
+					validateMandatoryColumns(finalPO, finalView, finalJsonObject, evt, windowNo);
+				}
+			};
+			
 			fireRestSaveEvent(po, PO_BEFORE_REST_SAVE, false);
 			try {
-				po.validForeignKeysEx();
+				String tableFilter = "(tableName="+po.get_TableName()+")";			
+				EventManager.getInstance().register(IEventTopics.PO_BEFORE_CHANGE, tableFilter, eventHandler);
+				try {
+					po.validForeignKeysEx();
+				} catch (AdempiereException ex) {
+					throw new IDempiereRestException(Msg.getMsg(po.getCtx(), "ValidationError"), ex.getMessage(), Status.BAD_REQUEST);
+				}
 				po.saveEx();
 				fireRestSaveEvent(po, PO_AFTER_REST_SAVE, false);
 			} catch (CrossTenantException e) {
 				trx.rollback();
-				return ResponseUtils.getResponseError(Status.INTERNAL_SERVER_ERROR, "Save error", 
+				return ResponseUtils.getResponseError(Status.BAD_REQUEST, Msg.getMsg(Env.getCtx(), "ValidationError"), 
 						"Foreign ID " + e.getFKValue() + " not found in ", String.valueOf(e.getFKColumn()));
 			}  catch (Exception ex) {
 				trx.rollback();
 				return ResponseUtils.getResponseErrorFromException(ex, "Save error");
+			} finally {
+				EventManager.getInstance().unregister(eventHandler);
 			}
 			
 			Map<String, JsonArray> detailMap = new LinkedHashMap<>();
@@ -635,7 +713,7 @@ public class ModelResourceImpl implements ModelResource {
 			final int parentId = po.get_ID();
 			for(String field : fields) {
 				JsonElement fieldElement = jsonObject.get(field);
-				if (fieldElement != null && fieldElement.isJsonArray()) {					
+				if (fieldElement != null && fieldElement.isJsonArray() && po.get_ColumnIndex(field) == -1) {
 					MRestView childView = null;
 					if (view != null) {
 						//find child view definition
@@ -676,20 +754,43 @@ public class ModelResourceImpl implements ModelResource {
 										throw new IDempiereRestException("Delete Error", "Cannot delete non-existing record", Status.NOT_FOUND);
 									
 									if (childPO == null) {
-										childPO = childSerializer.fromJson(childJsonObject, childTable, finalChildView);
+										childPO = childSerializer.fromJson(childJsonObject, childTable, finalChildView, trx.getTrxName());
 										childPO.set_ValueOfColumn(RestUtils.getKeyColumnName(tableName), parentId);
 									} else  if (!delete){
-										childPO = childSerializer.fromJson(childJsonObject, childPO, finalChildView);
+										childPO = childSerializer.fromJson(childJsonObject, childPO, finalChildView, trx.getTrxName());
 									}
 									childPO.set_TrxName(trx.getTrxName());
 									if (delete) {
 										childPO.deleteEx(true);
 									} else {
+										// Event handler for mandatory validation
+										PO finalChilPo = childPO;
+										JsonObject finalChildJsonObject = childJsonObject;
+										EventHandler childEventHandler = (Event evt) ->{
+											PO eventPO = EventHelper.getPO(evt);
+											if (eventPO == finalChilPo) {
+												validateMandatoryColumns(finalChilPo, finalChildView, finalChildJsonObject, evt, windowNo);
+											}
+										};
+										
 										fireRestSaveEvent(childPO, PO_BEFORE_REST_SAVE, false);
-										childPO.validForeignKeysEx();
-										childPO.saveEx();
+										try {
+											childPO.validForeignKeysEx();
+										} catch (AdempiereException ex) {
+											throw new IDempiereRestException(Msg.getMsg(Env.getCtx(), "ValidationError"), ex.getMessage(), Status.BAD_REQUEST);
+										}
+										try {
+											String childTableFilter = "(tableName="+childPO.get_TableName()+")";
+											if (childPO.is_new())
+												EventManager.getInstance().register(IEventTopics.PO_BEFORE_NEW, childTableFilter, childEventHandler);
+											else
+												EventManager.getInstance().register(IEventTopics.PO_BEFORE_CHANGE, childTableFilter, childEventHandler);
+											childPO.saveEx();
+										} finally {
+											EventManager.getInstance().unregister(childEventHandler);
+										}
 										fireRestSaveEvent(childPO, PO_AFTER_REST_SAVE, false);
-										childJsonObject = serializer.toJson(childPO, finalChildView);
+										childJsonObject = serializer.toJson(childPO, finalChildView, trx.getTrxName());
 										savedArray.add(childJsonObject);
 									}									
 								}
@@ -700,7 +801,7 @@ public class ModelResourceImpl implements ModelResource {
 							trx.rollback();
 							
 							if (ex instanceof CrossTenantException) 
-								return ResponseUtils.getResponseError(Status.INTERNAL_SERVER_ERROR, "Save Error", 
+								return ResponseUtils.getResponseError(Status.BAD_REQUEST, Msg.getMsg(Env.getCtx(), "ValidationError"), 
 										"Foreign ID " + ((CrossTenantException)ex).getFKValue() + " not found in ", String.valueOf(((CrossTenantException)ex).getFKColumn()));
 
 							return ResponseUtils.getResponseErrorFromException(ex, "Save error");
@@ -721,7 +822,7 @@ public class ModelResourceImpl implements ModelResource {
 			}
 			
 			po.load(trx.getTrxName());
-			jsonObject = serializer.toJson(po, view);
+			jsonObject = serializer.toJson(po, view, trx.getTrxName());
 			if (processMsg.length() > 0)
 				jsonObject.addProperty("doc-processmsg", processMsg.toString());
 			if (detailMap.size() > 0) {
@@ -827,6 +928,100 @@ public class ModelResourceImpl implements ModelResource {
 	}
 
 	@Override
+	public Response getArchives(String tableName, String id) {
+		MRestView view = null;
+		if (useRestView) {
+			view = RestUtils.getView(tableName);
+			if (view != null)
+				tableName = MTable.getTableName(Env.getCtx(), view.getAD_Table_ID());
+			else
+				return ResponseUtils.getResponseErrorFromException(new IDempiereRestException("Invalid rest view name", "No match found for rest view name: " + tableName, Status.NOT_FOUND), "Not found");
+		}
+
+		JsonArray array = new JsonArray();
+		POParser poParser = new POParser(tableName, id, true, false);
+		if (poParser.isValidPO()) {
+			PO po = poParser.getPO();
+			List<MArchive> archives = new Query(Env.getCtx(), MArchive.Table_Name, "AD_Table_ID=? AND Record_ID=?", null)
+					.setParameters(po.get_Table_ID(), po.get_ID())
+					.setOrderBy("Created DESC")
+					.list();
+			for (MArchive archive : archives) {
+				JsonObject entryJsonObject = new JsonObject();
+				entryJsonObject.addProperty("id", archive.getAD_Archive_ID());
+				if (!Util.isEmpty(archive.getName(), true))
+					entryJsonObject.addProperty("name", archive.getName());
+				entryJsonObject.addProperty("contentType", getArchiveContentType(archive));
+				entryJsonObject.addProperty("isReport", archive.isReport());
+				if (archive.getAD_Process_ID() > 0)
+					entryJsonObject.addProperty("processId", archive.getAD_Process_ID());
+				if (archive.getCreated() != null)
+					entryJsonObject.addProperty("created", archive.getCreated().toString());
+				array.add(entryJsonObject);
+			}
+			JsonObject json = new JsonObject();
+			json.add("archives", array);
+			return Response.ok(json.toString()).build();
+		} else {
+			return poParser.getResponseError();
+		}
+	}
+
+	@Override
+	public Response getArchiveEntry(String tableName, String id, int archiveId, String asJson) {
+		MRestView view = null;
+		if (useRestView) {
+			view = RestUtils.getView(tableName);
+			if (view != null)
+				tableName = MTable.getTableName(Env.getCtx(), view.getAD_Table_ID());
+			else
+				return ResponseUtils.getResponseErrorFromException(new IDempiereRestException("Invalid rest view name", "No match found for rest view name: " + tableName, Status.NOT_FOUND), "Not found");
+		}
+
+		POParser poParser = new POParser(tableName, id, true, false);
+		if (poParser.isValidPO()) {
+			PO po = poParser.getPO();
+			MArchive archive = new Query(Env.getCtx(), MArchive.Table_Name, "AD_Archive_ID=? AND AD_Table_ID=? AND Record_ID=?", null)
+					.setParameters(archiveId, po.get_Table_ID(), po.get_ID())
+					.first();
+			if (archive != null) {
+				byte[] binaryData = archive.getBinaryData();
+				if (binaryData != null) {
+					if (asJson == null) {
+						return Response.ok(binaryData).header("Content-Type", getArchiveContentType(archive)).build();
+					} else {
+						JsonObject json = new JsonObject();
+						json.addProperty("data", Base64.getEncoder().encodeToString(binaryData));
+						return Response.ok(json.toString(), "application/json").build();
+					}
+				}
+			}
+			return Response.status(Status.NOT_FOUND)
+					.entity(new ErrorBuilder().status(Status.NOT_FOUND)
+							.title("No archive entry found")
+							.append("No archive entry found for id: ")
+							.append(String.valueOf(archiveId))
+							.build().toString())
+					.build();
+		} else {
+			return poParser.getResponseError();
+		}
+	}
+
+	/**
+	 * Resolve the content type of an archive. Archives are normally report PDFs,
+	 * so fall back to application/pdf when the name carries no usable extension.
+	 * @param archive archive item
+	 * @return mime type
+	 */
+	private String getArchiveContentType(MArchive archive) {
+		String mimeType = Util.isEmpty(archive.getName(), true) ? null : MimeType.getMimeType(archive.getName());
+		if (Util.isEmpty(mimeType, true) || "application/octet-stream".equals(mimeType))
+			return archive.isReport() ? "application/pdf" : "application/octet-stream";
+		return mimeType;
+	}
+
+	@Override
 	public Response getAttachmentsAsZip(String tableName, String id, String asJson) {
 		MRestView view = null;
 		if (useRestView) {
@@ -860,7 +1055,13 @@ public class ModelResourceImpl implements ModelResource {
 					return ResponseUtils.getResponseErrorFromException(ex, "IO error");
 				}
 			}
-			return Response.status(Status.NO_CONTENT).build();
+			return Response.status(Status.NOT_FOUND)
+					.entity(new ErrorBuilder().status(Status.NOT_FOUND)
+							.title("No attachment found")
+							.append("No attachment found for ID: ")
+							.append(id)
+							.build().toString())
+					.build();
 		} else {
 			return poParser.getResponseError();
 		}
@@ -980,7 +1181,13 @@ public class ModelResourceImpl implements ModelResource {
 					}
 				}
 			}
-			return Response.status(Status.NO_CONTENT).build();
+			return Response.status(Status.NOT_FOUND)
+					.entity(new ErrorBuilder().status(Status.NOT_FOUND)
+							.title("No attachment entry found")
+							.append("No attachment entry found for file name: ")
+							.append(fileName)
+							.build().toString())
+					.build();
 		} else {
 			return poParser.getResponseError();
 		}
@@ -1247,6 +1454,8 @@ public class ModelResourceImpl implements ModelResource {
 		header.append("components:\n");		
 		YAMLSchema.addSecuritySchema(header);
 		YAMLSchema.addPredefinedParameters(header);
+		header.append(" ".repeat(2)).append("responses:\n");
+		YAMLSchema.addPredefinedResponses(header);
 		header.append(" ".repeat(2)).append("schemas:\n");
 		
 		StringBuilder body = new StringBuilder();
@@ -1284,5 +1493,265 @@ public class ModelResourceImpl implements ModelResource {
 		
 		YAMLSchema.addTableProperties(table, builder, 8);
 	}
+
+	/**
+	 * Check if column is mandatory
+	 * @param column column to check
+	 * @param jsonObject json object
+	 * @param mandatoryLogic mandatory logic
+	 * @return true if column is mandatory, false otherwise
+	 */
+	public static boolean isMandatory(MColumn column, JsonObject jsonObject, String mandatoryLogic) {
+		if (!Util.isEmpty(mandatoryLogic, true))
+		{
+			boolean retValue = false;
+			if (mandatoryLogic.startsWith(MColumn.VIRTUAL_UI_COLUMN_PREFIX))
+			{
+				retValue = Evaluator.parseSQLLogic(mandatoryLogic, Env.getCtx(), 0, -1, column.getColumnName());
+			}
+			else
+			{
+				DataProvider provider = new DataProvider() {
 	
+					@Override
+					public Object getValue(String columnName) {
+						JsonElement element = jsonObject.get(columnName);
+						if (element == null || element.isJsonNull() || !element.isJsonPrimitive())
+							return null;
+						return element.getAsString();
+					}
+	
+					@Override
+					public Object getProperty(String propertyName) {
+						return null;
+					}
+	
+					@Override
+					public MColumn getColumn(String columnName) {
+						return null;
+					}
+	
+					@Override
+					public String getTrxName() {
+						return null;
+					}
+					
+				};
+				DefaultEvaluatee evaluatee = new DefaultEvaluatee(provider);
+				retValue = Evaluator.evaluateLogic(evaluatee, mandatoryLogic);
+			}
+			if (retValue)
+				return true;
+		}
+
+		if (column.isVirtualColumn())
+			return false;
+
+		// Adapted from GridField.isMandatory
+		String columnName = column.getColumnName();
+		if ((column.isKey() && columnName.endsWith("_ID"))
+			|| columnName.startsWith("Created") || columnName.startsWith("Updated")
+			|| "Value".equals(columnName) 
+			|| "DocumentNo".equals(columnName)
+			|| "M_AttributeSetInstance_ID".equals(columnName)
+			|| DisplayType.YesNo == column.getAD_Reference_ID()
+			|| columnName.equalsIgnoreCase(PO.getUUIDColumnName(MTable.getTableName(Env.getCtx(), column.getAD_Table_ID()))))
+			return false;
+
+		return column.isMandatory();
+	}
+
+	/**
+	 * Perform mandatory validation for all columns (either MRestView columns or PO columns) 
+	 * @param po
+	 * @param view
+	 * @param json
+	 * @param event
+	 * @param windowNo 
+	 * @throws IDempiereRestException if there's one or more mandatory columns not filled up with value
+	 */
+	private void validateMandatoryColumns(PO po, MRestView view, JsonObject json, Event event, int windowNo) throws IDempiereRestException {
+		populateContextFromPO(po, view, windowNo);
+		fillDefaultValues(po, view, json, windowNo);
+		
+		List<String> mandatoryColumns = new ArrayList<>();
+		MTable table = MTable.get(po.getCtx(), po.get_Table_ID());
+		POInfo poInfo = POInfo.getPOInfo(po.getCtx(), po.get_Table_ID());
+		MRestViewColumn[] viewColumns = view != null ? view.getColumns() : null;
+		int count = view != null ? viewColumns.length : poInfo.getColumnCount();
+		Set<String> jsonFields = json.keySet();
+
+		for (int i = 0; i < count; i++) {
+			MRestViewColumn viewColumn = viewColumns != null ? viewColumns[i] : null;
+			String columnName = viewColumn != null ? MColumn.getColumnName(po.getCtx(), viewColumn.getAD_Column_ID()) : poInfo.getColumnName(i);
+			MColumn column = table.getColumn(columnName);
+			String propertyName = null;
+			if (viewColumns != null) {
+				propertyName = viewColumns[i].getName();
+			} else {
+				propertyName = TypeConverterUtils.toPropertyName(columnName);				
+			}
+			//rest view support json path mapping to nested json value object
+			String[] jsonPath = viewColumns != null ? propertyName.split("[.]") : null;
+			if (jsonPath != null && jsonPath.length > 1)
+				propertyName = jsonPath[0];
+
+			if (!po.is_new() && !jsonFields.contains(propertyName) && (viewColumns != null || !jsonFields.contains(columnName)))
+				continue;
+
+			Object value = po.get_ValueOfColumn(column.getAD_Column_ID());
+			if (value == null) {
+				if (viewColumn != null) {
+					if (viewColumn.isMandatory(json)) {
+						mandatoryColumns.add(propertyName);
+					}
+				} else if (isMandatory(column, json, column.getMandatoryLogic())) {
+					mandatoryColumns.add(propertyName);
+				}
+			}
+		}
+
+		if (!mandatoryColumns.isEmpty()) {
+			StringBuilder error = new StringBuilder();
+			for (String mandatoryColumn : mandatoryColumns) {
+				error.append(mandatoryColumn).append(", ");
+			}
+			error.delete(error.length() - 2, error.length());
+			IDempiereRestException ex = new IDempiereRestException(Msg.getMsg(po.getCtx(), "ValidationError"),
+					Msg.getMsg(po.getCtx(), "FillMandatory") + error.toString(), Status.BAD_REQUEST);
+			EventHelper.addError(event, ex);
+			throw ex;
+		}
+	}
+
+	/**
+	 * Populate context from existing PO values for default value parsing
+	 * @param po
+	 * @param view
+	 * @param windowNo
+	 */
+    private void populateContextFromPO(PO po, MRestView view, int windowNo) {
+		MTable table = MTable.get(po.getCtx(), po.get_Table_ID());
+		POInfo poInfo = POInfo.getPOInfo(po.getCtx(), po.get_Table_ID());
+		MRestViewColumn[] viewColumns = view != null ? view.getColumns() : null;
+		int count = view != null ? viewColumns.length : poInfo.getColumnCount();
+		for (int i = 0; i < count; i++) {
+			MRestViewColumn viewColumn = viewColumns != null ? viewColumns[i] : null;
+			String columnName = viewColumn != null ? MColumn.getColumnName(po.getCtx(), viewColumn.getAD_Column_ID()) : poInfo.getColumnName(i);
+			MColumn column = table.getColumn(columnName);
+			setContext(windowNo, columnName, po.get_ValueOfColumn(column.getAD_Column_ID()));
+		}
+    }
+
+    /**
+	 * Fill default values for mandatory columns if it is not set in json and current value in po is null.
+	 * @param po
+	 * @param view
+	 * @param json
+	 * @param windowNo
+	 */
+	private void fillDefaultValues(PO po, MRestView view, JsonObject json, int windowNo) {
+		MTable table = MTable.get(po.getCtx(), po.get_Table_ID());
+		POInfo poInfo = POInfo.getPOInfo(po.getCtx(), po.get_Table_ID());
+		MRestViewColumn[] viewColumns = view != null ? view.getColumns() : null;
+		int count = view != null ? viewColumns.length : poInfo.getColumnCount();
+		Set<String> jsonFields = json.keySet();
+
+		List<String> processedColumns = new ArrayList<>();
+		for (int i = 0; i < count; i++) {
+			MRestViewColumn viewColumn = viewColumns != null ? viewColumns[i] : null;
+			String columnName = viewColumn != null ? MColumn.getColumnName(po.getCtx(), viewColumn.getAD_Column_ID()) : poInfo.getColumnName(i);
+			if (processedColumns.contains(columnName))
+				continue;
+			processedColumns.add(columnName);
+			MColumn column = table.getColumn(columnName);
+			String propertyName = null;
+			if (viewColumns != null) {
+				propertyName = viewColumns[i].getName();
+			} else {
+				propertyName = TypeConverterUtils.toPropertyName(columnName);				
+			}
+			//rest view support json path mapping to nested json value object
+			String[] jsonPath = viewColumns != null ? propertyName.split("[.]") : null;
+			if (jsonPath != null && jsonPath.length > 1)
+				propertyName = jsonPath[0];
+
+			if (jsonFields.contains(propertyName) || jsonFields.contains(columnName)) {
+				if (po.get_ValueOfColumn(column.getAD_Column_ID()) != null) {
+					setContext(windowNo, columnName, po.get_ValueOfColumn(column.getAD_Column_ID()));
+				}
+				continue;
+			}
+				
+			if (po.is_new() && po.get_ValueOfColumn(column.getAD_Column_ID()) == null)
+				setDefaultValue(po, column, view, viewColumn, windowNo, processedColumns);
+		}
+	}
+
+	/**
+	 * Set default value for column if it is not virtual column, not key and not uuid column.
+	 * @param po
+	 * @param column
+	 * @param view
+	 * @param viewColumn
+	 * @param windowNo
+	 * @param processedColumns
+	 * @return
+	 */
+	private boolean setDefaultValue(PO po, MColumn column, MRestView view, MRestViewColumn viewColumn, int windowNo, List<String> processedColumns) {
+		if (!column.isVirtualColumn() && !column.isKey()
+			&& !column.getColumnName().equalsIgnoreCase(PO.getUUIDColumnName(po.get_TableName()))) {
+			GridFieldVO vo = GridFieldVO.createParameter(Env.getCtx(), windowNo, 0, 0, column.getAD_Column_ID(), column.getColumnName(), column.getName(), 
+						DisplayType.isLookup(column.getAD_Reference_ID()) 
+						? (DisplayType.isText(column.getAD_Reference_ID()) || DisplayType.isList(column.getAD_Reference_ID()) ? DisplayType.String : DisplayType.ID) 
+						: column.getAD_Reference_ID(), 0, false, false, "");
+			vo.DefaultValue = viewColumn != null && !Util.isEmpty(viewColumn.getDefaultValue(), true) ? viewColumn.getDefaultValue() : column.getDefaultValue();
+			ArrayList<String> dependents = new ArrayList<String>();
+			if (!Util.isEmpty(vo.DefaultValue, true))
+				Evaluator.parseDepends(dependents, vo.DefaultValue);
+			if (dependents != null && !dependents.isEmpty()) {
+				for (String dependent : dependents) {
+					if (!processedColumns.contains(dependent)) {
+						processedColumns.add(dependent);
+						MColumn dependentColumn = MColumn.get(Env.getCtx(), MTable.getTableName(Env.getCtx(), po.get_Table_ID()), dependent);
+						if (dependentColumn == null) {
+							continue;
+						}
+						if (po.get_Value(dependent) == null) {
+							MRestViewColumn dependentViewColumn = view != null ? Arrays.stream(view.getColumns())
+									.filter(vc -> MColumn.get(vc.getAD_Column_ID()).getColumnName().equalsIgnoreCase(dependent))
+									.findFirst().orElse(null) : null;									
+							setDefaultValue(po, dependentColumn, view, dependentViewColumn, windowNo, processedColumns);
+						}
+						if (po.get_Value(dependent) != null) {
+							setContext(windowNo, dependent, po.get_Value(dependent));
+						}
+					}
+				}
+			}
+			GridField gridField = new GridField(vo);
+			Object defaultValue = gridField.getDefault();
+			if (defaultValue != null) {
+				po.set_ValueOfColumn(column.getAD_Column_ID(), defaultValue);
+				setContext(windowNo, column.getColumnName(), defaultValue);
+				return true;
+			}
+		}		
+		return false;
+	}
+
+	private void setContext(int windowNo, String context, Object value) {
+		Properties ctx = Env.getCtx();
+		if (value == null)
+			Env.setContext(ctx, windowNo, context, (String) null);
+		else if (value instanceof Boolean)
+			Env.setContext(ctx, windowNo, context, (Boolean)value);
+		else if (value instanceof Timestamp)
+			Env.setContext(ctx, windowNo, context, (Timestamp)value);
+		else if (value instanceof Integer)
+			Env.setContext(ctx, windowNo, context, (Integer)value);
+		else
+			Env.setContext(ctx, windowNo, context, value.toString());
+	}
+
 }
